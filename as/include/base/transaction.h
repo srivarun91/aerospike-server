@@ -389,6 +389,12 @@ as_transaction_has_predexp(const as_transaction *tr)
 }
 
 static inline bool
+as_transaction_has_vector(const as_transaction *tr)
+{
+	return (tr->msg_fields & AS_MSG_FIELD_BIT_VECTOR_OP) != 0;
+}
+
+static inline bool
 as_transaction_has_record_version(const as_transaction *tr)
 {
 	return (tr->msg_fields & AS_MSG_FIELD_BIT_RECORD_VERSION) != 0;

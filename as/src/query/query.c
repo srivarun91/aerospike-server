@@ -74,6 +74,7 @@
 #include "geospatial/geospatial.h"
 #include "query/query_job.h"
 #include "query/query_manager.h"
+#include "query/vector_query.h"
 #include "sindex/sindex.h"
 #include "sindex/sindex_tree.h"
 #include "transaction/mrt_utils.h"
@@ -93,6 +94,7 @@ typedef enum {
 	QUERY_TYPE_AGGR		= 1,
 	QUERY_TYPE_UDF_BG	= 2,
 	QUERY_TYPE_OPS_BG	= 3,
+	QUERY_TYPE_VECTOR_DISTANCE = 4,
 
 	QUERY_TYPE_UNKNOWN	= -1
 } query_type;
@@ -135,6 +137,7 @@ static bool get_query_socket_timeout(const as_transaction* tr, int32_t* timeout)
 
 static bool get_query_sample_max(const as_transaction* tr, uint64_t* sample_max);
 static bool get_query_filter_exp(const as_transaction* tr, as_exp** exp);
+static bool get_query_vector(const as_transaction* tr, uint8_t** vector_data, uint32_t* vector_size);
 
 static bool range_from_msg_integer(const uint8_t* data, as_query_range* range, uint32_t len);
 static bool range_from_msg_string(const uint8_t* data, as_query_range* range, uint32_t len);
@@ -238,6 +241,8 @@ as_query(as_transaction* tr, as_namespace* ns)
 		return udf_bg_query_job_start(tr, ns);
 	case QUERY_TYPE_OPS_BG:
 		return ops_bg_query_job_start(tr, ns);
+		case QUERY_TYPE_VECTOR_DISTANCE:
+			return vector_distance_query_job_start(tr, ns);
 	default:
 		return AS_ERR_PARAMETER;
 	}
