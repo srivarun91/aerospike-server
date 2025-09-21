@@ -1,7 +1,7 @@
 /*
- * vector_query.h
+ * query_vector.h
  *
- * Copyright (C) 2022 Aerospike, Inc.
+ * Copyright (C) 2025 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -32,11 +32,19 @@
 // Forward declarations.
 //
 
-struct as_namespace_s;
 struct as_transaction_s;
+struct as_namespace_s;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 //==========================================================
 // Public API.
 //
 
 int vector_distance_query_job_start(struct as_transaction_s* tr, struct as_namespace_s* ns);
+
+#ifdef __cplusplus
+} // end extern "C"
+#endif

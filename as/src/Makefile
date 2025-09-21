@@ -140,10 +140,12 @@ GEOSPATIAL_HEADERS += geospatial.h
 GEOSPATIAL_SOURCES += geojson.cc
 GEOSPATIAL_SOURCES += geospatial.cc
 
+QUERY_HEADERS += query_vector.h
 QUERY_HEADERS += query.h
 QUERY_HEADERS += query_job.h
 QUERY_HEADERS += query_manager.h
 
+QUERY_SOURCES += query_vector.c
 QUERY_SOURCES += query.c
 QUERY_SOURCES += query_job.c
 QUERY_SOURCES += query_manager.c

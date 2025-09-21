@@ -24,7 +24,7 @@
 // Includes.
 //
 
-#include "query/vector_query.h"
+#include "query/query_vector.h"
 
 #include <errno.h>
 #include <math.h>
@@ -52,10 +52,6 @@
 
 
 //==============================================================================
-// Vector distance query implementation.
-//
-
-//==============================================================================
 // Vector serialization format definition
 //
 
@@ -77,6 +73,7 @@ typedef struct vector_header_s {
 } __attribute__((packed)) vector_header;
 
 #define VECTOR_HEADER_SIZE sizeof(vector_header)
+#define QUERY_CHUNK_LIMIT (1024U * 1024U) // TODO(varun): move to common place
 
 // Connection query job structure (copied from query.c)
 typedef struct conn_query_job_s {
@@ -321,11 +318,110 @@ vector_distance_query_job_start(as_transaction* tr, as_namespace* ns)
 	int result = as_query_manager_start_job(_job);
 
 	if (result != AS_OK) {
+        cf_warning(AS_QUERY, "vector distance query job %lu failed to start (%d)",
+            _job->trid, result);
 		conn_query_job_destroy(conn_job);
 		as_query_job_destroy(_job);
 	}
 
 	return result;
+}
+
+// Context structure to pass buffer builder to record matching function
+typedef struct vector_record_context_s {
+	vector_distance_query_job* job;
+	cf_buf_builder* bb;
+} vector_record_context;
+
+// Create a proper Aerospike message response with namespace, digest, and distance
+static void
+vector_distance_make_response_bufbuilder(cf_buf_builder** bb_r, as_storage_rd* rd, double distance)
+{
+	as_namespace* ns = rd->ns;
+	as_record* r = rd->r;
+
+	size_t ns_len = strlen(ns->name);
+	const char* set_name = as_index_get_set_name(r, ns);
+	size_t set_name_len = set_name ? strlen(set_name) : 0;
+
+	// Calculate message size
+	uint16_t n_fields = 2; // namespace and digest
+	size_t msg_sz = sizeof(as_msg) +
+			sizeof(as_msg_field) + ns_len +
+			sizeof(as_msg_field) + sizeof(cf_digest);
+
+	if (set_name) {
+		n_fields++;
+		msg_sz += sizeof(as_msg_field) + set_name_len;
+	}
+
+	// Add space for the distance bin
+	const char* distance_bin_name = "distance";
+	size_t distance_bin_name_len = strlen(distance_bin_name);
+	msg_sz += sizeof(as_msg_op) + distance_bin_name_len + sizeof(double);
+
+	uint8_t* buf;
+	cf_buf_builder_reserve(bb_r, (int)msg_sz, &buf);
+
+	as_msg* m = (as_msg*)buf;
+
+	m->header_sz = sizeof(as_msg);
+	m->info1 = 0;
+	m->info2 = 0;
+	m->info3 = 0;
+	m->info4 = 0;
+	m->result_code = AS_OK;
+	m->generation = plain_generation(r->generation, ns);
+	m->record_ttl = r->void_time;
+	m->transaction_ttl = 0;
+	m->n_fields = n_fields;
+	m->n_ops = 1; // just the distance bin
+
+	as_msg_swap_header(m);
+
+	buf = m->data;
+
+	// Add namespace field
+	as_msg_field* mf = (as_msg_field*)buf;
+	mf->field_sz = ns_len + 1;
+	mf->type = AS_MSG_FIELD_TYPE_NAMESPACE;
+	memcpy(mf->data, ns->name, ns_len);
+	as_msg_swap_field(mf);
+	buf += sizeof(as_msg_field) + ns_len;
+
+	// Add digest field
+	mf = (as_msg_field*)buf;
+	mf->field_sz = sizeof(cf_digest) + 1;
+	mf->type = AS_MSG_FIELD_TYPE_DIGEST_RIPE;
+	memcpy(mf->data, &r->keyd, sizeof(cf_digest));
+	as_msg_swap_field(mf);
+	buf += sizeof(as_msg_field) + sizeof(cf_digest);
+
+	// Add set field if present
+	if (set_name) {
+		mf = (as_msg_field*)buf;
+		mf->field_sz = set_name_len + 1;
+		mf->type = AS_MSG_FIELD_TYPE_SET;
+		memcpy(mf->data, set_name, set_name_len);
+		as_msg_swap_field(mf);
+		buf += sizeof(as_msg_field) + set_name_len;
+	}
+
+	// Add distance bin operation
+	as_msg_op* op = (as_msg_op*)buf;
+	op->op = AS_MSG_OP_READ;
+	op->name_sz = (uint8_t)distance_bin_name_len;
+	memcpy(op->name, distance_bin_name, distance_bin_name_len);
+	op->op_sz = OP_FIXED_SZ + op->name_sz + sizeof(double);
+	op->has_lut = 0;
+	op->unused_flags = 0;
+
+	// Add distance value as double particle (wire format)
+	uint8_t* particle_buf = op->name + op->name_sz;
+	op->particle_type = AS_PARTICLE_TYPE_FLOAT;
+	*(uint64_t*)particle_buf = cf_swap_to_be64(*(uint64_t*)&distance); // Store as big-endian
+
+	as_msg_swap_op(op);
 }
 
 // Vector distance query job slice - processes one partition
@@ -335,12 +431,26 @@ vector_distance_query_job_slice(as_query_job* _job, as_partition_reservation* rs
 {
 	vector_distance_query_job* job = (vector_distance_query_job*)_job;
 
-	cf_info(AS_QUERY, "vector distance query job %lu processing partition %u",
+	cf_detail(AS_QUERY, "vector distance query job %lu processing partition %u",
 		_job->trid, rsv->p->id);
+
+    uint64_t slice_start = cf_getns();
+
+    // FIXME(varun): Implement sample max/pagination.
 
 	// Use the provided buffer builder
 	if (*bb_r == NULL) {
-		*bb_r = cf_buf_builder_create_size(1024 * 1024); // 1MB
+		*bb_r = cf_buf_builder_create(1024 * 1024); // 1MB
+		cf_buf_builder_reserve(bb_r, (int)sizeof(as_proto), NULL);
+	}
+	else if (rsv == NULL) { // this thread finished all its partitions
+		cf_buf_builder* bb = *bb_r;
+
+		if (bb->used_sz > sizeof(as_proto)) {
+			conn_query_job_send_response((conn_query_job*)job, bb->buf, bb->used_sz);
+		}
+
+		return;
 	}
 
 	// Create context for record matching
@@ -349,22 +459,25 @@ vector_distance_query_job_slice(as_query_job* _job, as_partition_reservation* rs
 		.bb = *bb_r
 	};
 
+    // FIXME(varun): use set index if available.
 	// Scan all records in this partition
 	as_index_reduce(rsv->tree, vector_distance_query_record_matches, &ctx);
 
-	// Send accumulated results to client if buffer has data
+	// Check if we need to send accumulated results to client
 	cf_buf_builder* bb = *bb_r;
-	if (bb->used_sz > sizeof(as_proto)) {
-		conn_query_job_send_response((conn_query_job*)job, bb->buf, bb->used_sz);
-		cf_buf_builder_reset(bb);
-	}
-}
 
-// Context structure to pass buffer builder to record matching function
-typedef struct vector_record_context_s {
-	vector_distance_query_job* job;
-	cf_buf_builder* bb;
-} vector_record_context;
+	// If we exceed the proto size limit, send accumulated data back to client
+	// and reset the buf-builder to start a new proto.
+	if (bb->used_sz > QUERY_CHUNK_LIMIT) {
+		if (conn_query_job_send_response((conn_query_job*)job, bb->buf, bb->used_sz)) {
+			cf_buf_builder_reset(bb);
+			cf_buf_builder_reserve(bb_r, (int)sizeof(as_proto), NULL);
+		}
+	}
+
+    cf_detail(AS_QUERY, "vector distance query job %lu pid %u took %lu us",
+        _job->trid, rsv->p->id, (cf_getns() - slice_start) / 1000);
+}
 
 // Process individual record for vector distance calculation
 static bool
@@ -409,7 +522,7 @@ vector_distance_query_record_matches(as_index_ref* r_ref, void* udata)
 			vector_header record_header;
 			const uint8_t* record_vector_data;
 
-			if (!parse_vector_blob((const uint8_t*)record_vector_blob, blob_size,
+			if (! parse_vector_blob((const uint8_t*)record_vector_blob, blob_size,
 					&record_header, &record_vector_data)) {
 				cf_debug(AS_QUERY, "failed to parse record vector for %pD", &r->keyd);
 				continue; // Skip invalid vector
@@ -425,15 +538,24 @@ vector_distance_query_record_matches(as_index_ref* r_ref, void* udata)
 				continue;
 			}
 
-			// Add result to response buffer
-			cf_buf_builder_append_uint64(ctx->bb, (uint64_t)r->keyd.digest[0]);
-			cf_buf_builder_append_uint64(ctx->bb, (uint64_t)r->keyd.digest[1]);
-			cf_buf_builder_append_uint64(ctx->bb, *(uint64_t*)&distance); // Store as uint64
+			// Create proper Aerospike message response with namespace, digest, and distance
+			vector_distance_make_response_bufbuilder(&ctx->bb, &rd, distance);
 
 			as_incr_uint64(&_job->n_succeeded);
 
 			cf_debug(AS_QUERY, "vector distance calculated: %f for record %pD",
 				distance, &r->keyd);
+
+			// Check if we need to send chunk to avoid buffer overflow
+			cf_buf_builder* bb = ctx->bb;
+			if (bb->used_sz > QUERY_CHUNK_LIMIT) {
+				if (! conn_query_job_send_response((conn_query_job*)job, bb->buf, bb->used_sz)) {
+					break; // Connection failed, stop processing
+				}
+
+				cf_buf_builder_reset(bb);
+				cf_buf_builder_reserve(&ctx->bb, (int)sizeof(as_proto), NULL);
+			}
 		}
 	}
 
@@ -492,7 +614,9 @@ conn_query_job_init(conn_query_job* job, const as_transaction* tr)
 	cf_mutex_init(&job->fd_lock);
 
 	job->fd_h = tr->from.proto_fd_h;
-	as_file_handle_reserve(job->fd_h);
+	job->fd_timeout = CF_SOCKET_TIMEOUT;
+
+	job->compress_response = as_transaction_compress_response(tr);
 }
 
 static void
@@ -512,7 +636,8 @@ conn_query_job_finish(conn_query_job* job)
 		}
 		else {
 			uint64_t before_ns = cf_getns();
-			size_t size_sent = as_msg_send_fin(job->fd_h->sock, AS_OK);
+			size_t size_sent = as_msg_send_fin_timeout(&job->fd_h->sock,
+					(uint32_t)_job->abandoned, job->fd_timeout);
 
 			if (size_sent != 0) {
 				job->net_io_ns += cf_getns() - before_ns;
@@ -542,17 +667,22 @@ conn_query_job_send_response(conn_query_job* job, uint8_t* buf, size_t size)
 	size_t size_sent = send_blocking_response_chunk(job->fd_h, buf, size,
 			job->fd_timeout, job->compress_response, NULL);
 
+	if (size_sent == 0) {
+		int reason = errno == ETIMEDOUT ?
+				AS_QUERY_RESPONSE_TIMEOUT : AS_QUERY_RESPONSE_ERROR;
+
+		conn_query_job_release_fd(job, true);
+		cf_mutex_unlock(&job->fd_lock);
+		as_query_manager_abandon_job(_job, reason);
+		return false;
+	}
+
 	if (size_sent != 0) {
 		job->net_io_ns += cf_getns() - before_ns;
 		job->net_io_bytes += size_sent;
 	}
 
 	cf_mutex_unlock(&job->fd_lock);
-
-	if (size_sent == 0) {
-		conn_query_job_release_fd(job, true);
-		return false;
-	}
 
 	return true;
 }
